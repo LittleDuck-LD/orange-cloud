@@ -1,0 +1,180 @@
+name: Build full-feature iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ios-full-ipa.yml
+      - apps/ios/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-full-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'LittleDuck-LD/orange-cloud'
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      PROJECT: apps/ios/Orange Cloud/Orange Cloud.xcodeproj
+      SCHEME: Orange Cloud
+      CF_OAUTH_CLIENT_ID: ${{ vars.CF_OAUTH_CLIENT_ID }}
+      CF_OAUTH_REDIRECT_URI: ${{ vars.CF_OAUTH_REDIRECT_URI }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check Xcode and SDKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          xcodebuild -version | tee output/xcode-version.txt
+          xcodebuild -showsdks
+          xcrun swift --version
+          python3 - <<'PY'
+          import re, subprocess
+          version = subprocess.check_output(['xcodebuild', '-version'], text=True)
+          match = re.search(r'Xcode (\d+)', version)
+          if not match or int(match.group(1)) < 26:
+              raise SystemExit('This project needs Xcode 26 or later.')
+          PY
+
+      - name: Apply optional personal OAuth configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          client = os.environ.get('CF_OAUTH_CLIENT_ID', '').strip()
+          redirect = os.environ.get('CF_OAUTH_REDIRECT_URI', '').strip()
+          if bool(client) != bool(redirect):
+              raise SystemExit('Set both CF_OAUTH_CLIENT_ID and CF_OAUTH_REDIRECT_URI repository variables.')
+          if client:
+              if not redirect.startswith('https://'):
+                  raise SystemExit('Cloudflare requires an HTTPS OAuth redirect URI.')
+              path = Path('apps/ios/Orange Cloud/Orange Cloud/Core/Auth/OAuthConfig.swift')
+              source = path.read_text()
+              for key, value in [('clientID', client), ('redirectURI', redirect)]:
+                  pattern = rf'^(\s*static let {key}\s*=\s*)"[^"\n]*"'
+                  source, count = re.subn(pattern, lambda m: m.group(1) + json.dumps(value, ensure_ascii=False), source, flags=re.M)
+                  if count != 1:
+                      raise SystemExit(f'Expected one active {key} declaration; found {count}.')
+              path.write_text(source)
+              print('Personal OAuth configuration applied.')
+          else:
+              print('::warning::No personal OAuth configuration supplied. Source OAuth settings are unchanged; configure your own Cloudflare OAuth client and HTTPS callback relay before using this self-built app to sign in. See CONTRIBUTING.md.')
+          PY
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/OrangeCloudPackages" \
+            2>&1 | tee output/packages.log
+
+      - name: Archive full-feature app without signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OrangeCloud.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/OrangeCloudDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/OrangeCloudPackages" \
+            -resultBundlePath "$RUNNER_TEMP/OrangeCloudBuild.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) OPENSOURCE_UNLOCKED' \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee output/archive.log
+
+      - name: Package and check unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/OrangeCloud.xcarchive/Products/Applications/Orange Cloud.app"
+          test -d "$APP"
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          test -f "$APP/$EXECUTABLE"
+          xcrun lipo -verify_arch arm64 "$APP/$EXECUTABLE"
+          mkdir -p "$RUNNER_TEMP/OrangeCloudIPA/Payload"
+          ditto "$APP" "$RUNNER_TEMP/OrangeCloudIPA/Payload/Orange Cloud.app"
+          (
+            cd "$RUNNER_TEMP/OrangeCloudIPA"
+            ditto -c -k --keepParent Payload "$GITHUB_WORKSPACE/output/OrangeCloud-Full-Unsigned.ipa"
+          )
+          python3 - <<'PY'
+          import hashlib, json, os, plistlib, zipfile
+          from pathlib import Path
+          ipa = Path('output/OrangeCloud-Full-Unsigned.ipa')
+          with zipfile.ZipFile(ipa) as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('IPA integrity check failed.')
+              prefix = 'Payload/Orange Cloud.app/'
+              info = plistlib.loads(archive.read(prefix + 'Info.plist'))
+              if prefix + info['CFBundleExecutable'] not in archive.namelist():
+                  raise SystemExit('App executable missing from IPA.')
+              embedded = [n for n in archive.namelist() if n.endswith('.appex/Info.plist') or '/Watch/' in n and n.endswith('.app/Info.plist')]
+          report = {
+              'source_commit': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'bundle_id': info['CFBundleIdentifier'],
+              'version': info.get('CFBundleShortVersionString'),
+              'build': info.get('CFBundleVersion'),
+              'minimum_os': info.get('MinimumOSVersion'),
+              'full_features': True,
+              'compilation_condition': 'OPENSOURCE_UNLOCKED',
+              'signed': False,
+              'personal_oauth_configured': bool(os.environ.get('CF_OAUTH_CLIENT_ID')),
+              'embedded_extensions': embedded,
+              'size_bytes': ipa.stat().st_size,
+              'sha256': hashlib.sha256(ipa.read_bytes()).hexdigest(),
+          }
+          Path('output/build-info.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Full-feature unsigned IPA\n\n')
+              summary.write(f"- Version: {report['version']} ({report['build']})\n")
+              summary.write(f"- Commit: `{report['source_commit']}`\n")
+              summary.write('- All Pro gates enabled using the upstream self-build flag.\n')
+              summary.write('- Unsigned: sign the app and its extensions before installing on an iPhone.\n')
+              summary.write('- Configure your own Cloudflare OAuth client and callback relay before sign-in.\n')
+          PY
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeCloud-Full-Unsigned
+          path: |
+            output/OrangeCloud-Full-Unsigned.ipa
+            output/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeCloud-Build-Logs
+          path: |
+            output/*.log
+            output/xcode-version.txt
+          if-no-files-found: ignore
+          retention-days: 7
