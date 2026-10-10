@@ -113,7 +113,7 @@ jobs:
           test -d "$APP"
           EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
           test -f "$APP/$EXECUTABLE"
-          xcrun lipo -verify_arch arm64 "$APP/$EXECUTABLE"
+          xcrun lipo "$APP/$EXECUTABLE" -verify_arch arm64
           mkdir -p "$RUNNER_TEMP/OrangeCloudIPA/Payload"
           ditto "$APP" "$RUNNER_TEMP/OrangeCloudIPA/Payload/Orange Cloud.app"
           (
